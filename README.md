@@ -63,20 +63,21 @@ from five repetitions; result parity is checked before timing.
 
 | case | mojo-editdistance | editdistance 0.8.1 | relative |
 | --- | ---: | ---: | ---: |
-| eval ASCII 64 vs 64 | 2.0 us | 3.7 us | 1.90x faster |
-| eval ASCII 1,024 vs 1,024 | 155.4 us | 2766.1 us | 17.80x faster |
-| eval ASCII 64 vs 100,000 | 1088.6 us | 5606.1 us | 5.15x faster |
-| eval Unicode 1,000 vs 1,000 | 242.4 us | 3513.8 us | 14.49x faster |
-| eval integer lists 1,000 vs 1,000 | 660.1 us | 3271.0 us | 4.96x faster |
-| criterion 2,000 chars, threshold 2 | 49.1 us | 292.6 us | 5.96x faster |
+| eval ASCII 64 vs 64 | 1.9 us | 3.6 us | 1.89x faster |
+| eval ASCII 1,024 vs 1,024 | 154.7 us | 2681.3 us | 17.33x faster |
+| eval ASCII 64 vs 100,000 | 396.7 us | 5364.9 us | 13.52x faster |
+| eval Unicode 1,000 vs 1,000 | 154.7 us | 2745.8 us | 17.75x faster |
+| eval integer lists 1,000 vs 1,000 | 345.6 us | 2599.0 us | 7.52x faster |
+| criterion 2,000 chars, threshold 2 | 23.5 us | 167.9 us | 7.13x faster |
 
 Short ASCII strings encode once to compact byte buffers, while bytes pairs use
-their existing storage directly across the FFI boundary. A one-word Myers
-kernel builds a stack-resident character mask table, clears it with
-native-width SIMD stores, and avoids all NumPy token and scratch allocations.
-Short non-ASCII strings use UTF-32 buffers and SIMD pattern scans with a scalar
-tail. The benchmark validates that both implementations return the same result
-before timing them.
+their existing storage directly across the FFI boundary. When the shorter ASCII
+or bytes input fits one 64-bit word, that path also handles arbitrarily long
+text without allocating NumPy token, hash-table, or scratch buffers. Its Myers
+kernel builds a stack-resident character mask table and clears it with
+native-width SIMD stores. Short non-ASCII strings use UTF-32 buffers and SIMD
+pattern scans with a scalar tail. The benchmark validates that both
+implementations return the same result before timing them.
 
 ## How it works
 
@@ -95,8 +96,11 @@ trimming, keeping auxiliary memory linear in the shorter input. Criterion calls
 use a threshold-width DP band, so small thresholds avoid filling the rest of
 the matrix.
 
-There is no threaded or GPU path. Myers advances through the text serially, and
-each Wagner-Fischer cell depends on its left, upper, and diagonal neighbors.
+There is no threaded or GPU path. Myers advances through the text with a loop-
+carried state, while each Wagner-Fischer cell depends on its left, upper, and
+diagonal neighbors. No current kernel combines enough independent work with
+high arithmetic intensity to offset thread, GPU launch, and transfer overhead,
+so a GPU path would not be justified.
 
 The exported Mojo functions live in one compilation unit to keep build cost
 fixed. They use a C ABI and are loaded by Python through `ctypes`.

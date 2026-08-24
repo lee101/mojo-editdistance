@@ -118,11 +118,24 @@ def test_short_simd_vector_and_tail_parity(implementations):
         )
 
 
-def test_short_pattern_long_text_uses_multiword_path(implementations):
+def test_short_pattern_long_text_uses_word_path(implementations):
     ours, upstream = implementations
     a = "abcd" * 16
     b = "z" * 257
     assert ours.eval(a, b) == upstream.eval(a, b)
+    assert ours.eval(a.encode(), b.encode()) == upstream.eval(
+        a.encode(), b.encode()
+    )
+
+
+def test_word_path_handles_large_text_and_simd_tail(implementations):
+    ours, upstream = implementations
+    a = "abcde" * 7
+    b = ("abcdf" * 20_001)[:100_003]
+    assert ours.eval(a, b) == upstream.eval(a, b)
+    assert ours.eval(a.encode(), b.encode()) == upstream.eval(
+        a.encode(), b.encode()
+    )
 
 
 def test_dp_fallback_matches_upstream(implementations):

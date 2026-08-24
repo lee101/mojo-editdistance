@@ -92,7 +92,6 @@ def eval(a: Any, b: Any) -> int:
         type(a) is str
         and type(b) is str
         and min(len(a), len(b)) <= 64
-        and max(len(a), len(b)) <= 256
     ):
         if a.isascii() and b.isascii():
             return int(
@@ -108,7 +107,6 @@ def eval(a: Any, b: Any) -> int:
         type(a) is bytes
         and type(b) is bytes
         and min(len(a), len(b)) <= 64
-        and max(len(a), len(b)) <= 256
     ):
         return int(lib().med_distance_u8_word(a, len(a), b, len(b)))
 
