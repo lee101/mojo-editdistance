@@ -35,6 +35,7 @@ def test_published_and_standard_vectors(implementations, a, b, expected):
     ours, upstream = implementations
     assert ours.eval(a, b) == expected
     assert ours.eval(a, b) == upstream.eval(a, b)
+    assert upstream.eval(a, b) == expected
 
 
 def test_unicode_codepoints_match_upstream(implementations):
@@ -224,7 +225,7 @@ def test_dp_fallback_matches_upstream(implementations):
     ours, upstream = implementations
     a = "ab" * 550
     b = "ba" * 550
-    assert ours.eval(a, b) == upstream.eval(a, b) == 2
+    assert ours.eval(a, b) == upstream.eval(a, b) == 2 == 2
 
 
 def test_criterion_matches_upstream_for_all_thresholds(implementations):

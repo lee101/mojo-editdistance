@@ -59,29 +59,44 @@ pixi run python -c \
 
 Measured with `pixi run bench` on an Intel Xeon E5-2697 v4 at 2.30 GHz,
 Linux 6.8.0-147-generic, and Python 3.13.14. Each entry is the best mean time
-from five repetitions; result parity is checked before timing. The two right
-columns are the same case on the previous source tree and on the current
-kernels; `EDITDISTANCE_LIBRARY=<lib> pixi run python bench/bench.py` selects the
-library, so both sides run without a rebuild in between.
+from five repetitions; result parity is checked before timing. All seven rows
+below are from one `pixi run bench` run in the verification pass (load average
+18-31 on 72 CPUs); see `bench/verify.md` for that run, the five other runs, and
+the figures the table carried before.
 
-| case | mojo-editdistance | editdistance 0.8.1 | relative | previous kernels | change |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| eval ASCII 64 vs 64 | 1.9 us | 3.7 us | 1.93x faster | 2.0 us | none |
-| eval ASCII 1,024 vs 1,024 | 149.9 us | 2719.0 us | 18.14x faster | 161.0 us | within noise |
-| eval ASCII 64 vs 100,000 | 475.8 us | 5394.4 us | 11.34x faster | 490.5 us | within noise |
-| eval Unicode 1,000 vs 1,000 | 148.3 us | 2699.4 us | 18.20x faster | 160.7 us | within noise |
-| eval integer lists 1,000 vs 1,000 | 323.7 us | 2561.1 us | 7.91x faster | 349.7 us | within noise |
-| criterion 2,000 chars, threshold 2 | 21.6 us | 164.5 us | 7.63x faster | 23.2 us | none |
-| criterion 2,000 chars, threshold 16 | 27.9 us | 754.9 us | 27.05x faster | 31.1 us | 1.07x faster |
+| case | mojo-editdistance | editdistance 0.8.1 | relative |
+| --- | ---: | ---: | ---: |
+| eval ASCII 64 vs 64 | 2.1 us | 4.1 us | 1.93x faster |
+| eval ASCII 1,024 vs 1,024 | 148.0 us | 2848.3 us | 19.25x faster |
+| eval ASCII 64 vs 100,000 | 496.7 us | 5748.1 us | 11.57x faster |
+| eval Unicode 1,000 vs 1,000 | 144.8 us | 2779.0 us | 19.19x faster |
+| eval integer lists 1,000 vs 1,000 | 339.1 us | 2658.9 us | 7.84x faster |
+| criterion 2,000 chars, threshold 2 | 22.1 us | 161.3 us | 7.29x faster |
+| criterion 2,000 chars, threshold 16 | 28.2 us | 752.6 us | 26.65x faster |
 
-The eval rows and threshold 2 move by several percent between runs on this
-shared machine, and no run showed a repeatable gap for them, so they are
-reported as unchanged. The interleaved measurement in `bench/ab.py` (both
-libraries in one process, alternating batches) separates them cleanly: threshold
-16 is 1.061x, and every other row is between 0.997x and 1.010x. A sweep over
-thresholds also shows the gain widening with the band width - about 1.04x at 8,
-1.09x at 16, 1.13x at 32 and 1.17x at 64 - because the branch that was removed
-ran once per band cell.
+Both sides run the same case in one process: the same argument objects are
+passed to each implementation, both return the same result, which is checked
+before any timing, and both are wrapped in the same `time.perf_counter` loop.
+One asymmetry is worth stating because it is the only place the two sides run
+different amounts of work: the criterion kernels strip common prefix and
+suffix, and `editdistance` 0.8.1 never does. The threshold 2 case shares a
+1,988-character suffix, so the trimmed problem this port solves there is 12 by 12
+while upstream fills the full 2,000-wide band. Timing this port on the same
+inputs with that shared run destroyed, or with no shared run at all, moved the
+row by at most 6% in either direction (measured in `bench/verify.md`), so the
+row is not driven by the trimming, but it does not isolate the kernel either.
+
+The eval rows move by several percent between runs on this shared machine. The
+previous version of this table made claims that measurement did not support,
+and they have been removed: a threshold sweep from 1.04x at 8 to 1.17x at 64,
+and a "previous kernels" column. The sweep was not reproduced in the
+verification pass, and the previous-tree library it was measured against was
+never kept. The one previous-kernel figure that could be rebuilt was in error:
+rebuilding the kernel from the commit before the unroll pass (which predates the
+SIMD pass as well) and interleaving it with this checkout's library gives 30.1 us
+against 28.6 us at threshold 16 (1.05x, not 1.07x), and the same runs move the
+1,024-token eval rows by 7-8% (1.076-1.080x, not "within noise"). Details in
+`bench/verify.md`.
 
 Wrong kernels are easy to benchmark: an early attempt in this pass wrote mask
 words past the end of the table for one-word patterns and still returned
@@ -151,8 +166,8 @@ length, best of five batches):
 | 1,024 | 169 us |
 | 2,048 | 7.8 ms |
 | 4,096 | 30.8 ms |
-| 8,192 | 126 ms |
-| 16,384 | 500 ms |
+| 8,192 | 141 ms |
+| 16,384 | 495 ms |
 
 The crossover measurement had to clear two obstacles before it could be trusted,
 and neither could be removed on this toolchain:
@@ -280,9 +295,9 @@ the 2-operations-per-byte gate, and neither side produces a shippable win:
 | path | intensity | verdict |
 | --- | ---: | --- |
 | bit kernel, 64 vs 100,000 | 1.12 ops/byte | **CPU only: memory-bound** |
-| bit kernel, 1,024 vs 1,024 | 256 ops/byte | 143-170 us CPU vs ~16 us transfer; but the text scan carries `vp`/`vn` per position, so the required "one launch, copies outside the loop" shape does not exist for it |
-| criterion, 2,000 / threshold 16 | 8.0 ops/byte | whole call is 23-27 us; the round trip alone is ~30 us |
-| Wagner-Fischer 16,384 vs 16,384 | 4,096 ops/byte | transfer is ~17 us against 508-520 ms CPU, but this is the fallback path: real callers of that size are routed to the bit kernel, and the DP has no row parallelism |
+| bit kernel, 1,024 vs 1,024 | 256 ops/byte | 139-170 us CPU vs ~16 us transfer; but the text scan carries `vp`/`vn` per position, so the required "one launch, copies outside the loop" shape does not exist for it |
+| criterion, 2,000 / threshold 16 | 8.0 ops/byte | whole call is 22-30 us; the round trip alone is ~30 us |
+| Wagner-Fischer 16,384 vs 16,384 | 4,096 ops/byte | transfer is ~17 us against 508-536 ms CPU, but this is the fallback path: real callers of that size are routed to the bit kernel, and the DP has no row parallelism |
 
 The measured host<->device round trip (copy in + copy out + sync, best of 20) was
 128 KiB: 16 us; 512 KiB: 42 us; 2 MiB: 123 us; 8 MiB: 419 us; 32 MiB: 1155 us;
@@ -300,11 +315,11 @@ CPU comparison for the same calls, in this checkout
 
 | case | CPU today |
 | --- | ---: |
-| eval ASCII 64 vs 100,000 | 484 us |
-| eval ASCII 1,024 vs 1,024 | 170 us |
-| criterion 2,000, threshold 16 | 27 us |
-| eval integer lists 4,096 vs 4,096 (no trim) | 33.4 ms |
-| eval integer lists 16,384 vs 16,384 (no trim) | 520 ms |
+| eval ASCII 64 vs 100,000 | 492 us |
+| eval ASCII 1,024 vs 1,024 | 139-170 us |
+| criterion 2,000, threshold 16 | 22-31 us |
+| eval integer lists 4,096 vs 4,096 (no trim) | 33.3 ms |
+| eval integer lists 16,384 vs 16,384 (no trim) | 536 ms |
 
 **Before and after are identical.** No shipped code changed, so the benchmark table
 above still stands unchanged; this pass adds `bench/analysis.md`,
@@ -334,16 +349,17 @@ uses the shapes the compiler accepts: `enqueue_create_buffer[DType.int64](n)` (n
 as fixed-width `Int64` (`Int` is not `DevicePassable`), and `enqueue_copy(dst, src)`.
 `bench/gpu_probe.py` documents each of these at the point it matters.
 
-**One CPU number worth flagging.** The 16,384 by 16,384 DP fallback appears in
-this README as 508-520 ms and also as 126 ms for 8,192 in the parallel-pass table,
-which would make the doubling 4x rather than 2x. The 508-520 ms figure was checked
-two ways: `eval` on integer arrays with no common prefix or suffix, and a minimal
-copy of the shipped `_distance_dp` row loop with trimming disabled, both at
-508-521 ms. A faster standalone attempt was **wrong**, not faster: it returned
-15,544 where the plain loop returns 11,374, and a corrected version was no faster
-than the plain loop. So the DP cost here is measured, not assumed, and nothing in
-this pass derives a GPU win from it. The 8,192 row was not re-measured; the
-`bench/sizes.py` curve it came from is unchanged.
+**One CPU number worth flagging.** The 16,384 by 16,384 DP fallback was
+re-measured in the verification pass: `eval` on random integer arrays with no
+common prefix or suffix took 510.4 ms, and `bench/sizes.py` reports
+495,481.7 us (495.5 ms) for the same size. The 8,192 row in the parallel-pass
+table said 126 ms, which would make the doubling 4x rather than 2x; re-running
+`bench/sizes.py` gives 140,679.4 us for 8,192 and 495,481.7 us for 16,384, a
+3.5x doubling. The 126 ms figure is withdrawn and `bench/sizes.py`'s measured
+141 ms is used instead. The earlier standalone "faster" attempt is still
+recorded as wrong: it returned 15,544 where the plain loop returns 11,374, so
+it was not faster, it was incorrect. The DP cost is therefore measured, not
+assumed, and nothing here derives a GPU win from it.
 
 ## Not covered
 
