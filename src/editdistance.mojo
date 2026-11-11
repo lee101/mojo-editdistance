@@ -18,11 +18,16 @@ def _distance_word[dtype: DType](
     pattern_len: Int,
     text: Pointer[Scalar[dtype], AnyOrigin[mut=True]],
     text_len: Int,
+    wide: Bool,
 ) -> Int:
-    comptime W = simdwidthof[DType.float64]()
-    var lane_bits = SIMD[DType.uint64, W]()
+    # The pattern bits are distinct positions, so collecting matches with OR and
+    # reducing once after the scan gives the same word as adding per chunk. That
+    # fuses the horizontal reduction into the loop and compares the whole
+    # register at a time.
+    comptime W = simdwidthof[dtype]()
+    var lanes = SIMD[DType.uint64, W]()
     for lane in range(W):
-        lane_bits[lane] = UInt64(1) << UInt64(lane)
+        lanes[lane] = UInt64(1) << UInt64(lane)
     var zeros = SIMD[DType.uint64, W]()
     var shift = SIMD[DType.uint64, W](UInt64(W))
 
@@ -30,14 +35,19 @@ def _distance_word[dtype: DType](
     var vn = UInt64(0)
     var top = UInt64(1) << UInt64(pattern_len - 1)
     var score = pattern_len
+    # The vector condition is `j + W <= pattern_len` rather than a precomputed
+    # limit. That lets the compiler peel the last partial chunk out of the loop
+    # (the condition is then known false there), which keeps the whole scan -
+    # distance recurrence included - in one vectorised loop body. Rewriting it as
+    # `j < head` costs 0.70x on the short non-ASCII row.
     for i in range(text_len):
         var x = UInt64(0)
-        var weights = lane_bits
+        var weights = lanes
         var j = 0
         var target = SIMD[dtype, W](text.unsafe_load(i))
         while j + W <= pattern_len:
             var matches = pattern.unsafe_load[width=W](j).eq(target)
-            x += matches.select(weights, zeros).reduce_add()
+            x |= matches.select(weights, zeros).reduce_add()
             weights = weights << shift
             j += W
         while j < pattern_len:
@@ -90,15 +100,22 @@ def _distance_word_u8(
     return score
 
 
-def _slot(
-    keys: I64Ptr, used: U8Ptr, capacity: Int, token: Int64, insert: Bool
-) -> Int:
+def _probe(keys: I64Ptr, used: U8Ptr, capacity: Int, token: Int64) -> Int:
     var value = Int(token)
     var index = (value ^ (value >> 33) ^ (value >> 17)) & (capacity - 1)
     while used.unsafe_load(index) != 0:
         if keys.unsafe_load(index) == token:
             return index
         index = (index + 1) & (capacity - 1)
+    return index
+
+
+def _slot(
+    keys: I64Ptr, used: U8Ptr, capacity: Int, token: Int64, insert: Bool
+) -> Int:
+    var index = _probe(keys, used, capacity, token)
+    if used.unsafe_load(index) != 0:
+        return index
     if insert:
         used.unsafe_store(index, 1)
         keys.unsafe_store(index, token)
@@ -122,18 +139,41 @@ def _distance_bit(
     hn: U64Ptr,
 ) -> Int:
     var words = (pattern_len + 63) >> 6
-    for i in range(capacity):
-        used.unsafe_store(i, 0)
-    for i in range(capacity * words):
-        masks.unsafe_store(i, 0)
+    comptime UW = simdwidthof[DType.uint8]()
+    comptime MW = simdwidthof[DType.uint64]()
+    var no_bytes = SIMD[DType.uint8, UW]()
+    var no_words = SIMD[DType.uint64, MW]()
+    var i = 0
+    while i + UW <= capacity:
+        used.store(i, no_bytes)
+        i += UW
+    while i < capacity:
+        used.unsafe_store(i, UInt8(0))
+        i += 1
 
+    # Fused clear and build: a token's mask row is zeroed by the same pass that
+    # first inserts the token, instead of clearing all `capacity * words` entries
+    # up front. Only rows of distinct pattern tokens are read back by the text
+    # loop, and each is written here (zeroed, then OR-ed) before that can happen.
     for i in range(pattern_len):
-        var index = _slot(keys, used, capacity, pattern.unsafe_load(i), True)
+        var token = pattern.unsafe_load(i)
+        var index = _probe(keys, used, capacity, token)
+        var fresh = used.unsafe_load(index) == 0
+        if fresh:
+            used.unsafe_store(index, 1)
+            keys.unsafe_store(index, token)
         var word = i >> 6
-        var bit = i & 63
-        var mask_index = index * words + word
-        var mask_value = masks.unsafe_load(mask_index) | (UInt64(1) << UInt64(bit))
-        masks.unsafe_store(mask_index, mask_value)
+        var bit = UInt64(1) << UInt64(i & 63)
+        var row = index * words
+        if fresh:
+            var w = 0
+            while w + MW <= words:
+                masks.store(row + w, no_words)
+                w += MW
+            while w < words:
+                masks.unsafe_store(row + w, UInt64(0))
+                w += 1
+        masks.unsafe_store(row + word, masks.unsafe_load(row + word) | bit)
 
     for word in range(words):
         vp.unsafe_store(word, ~UInt64(0))
@@ -183,12 +223,12 @@ def _distance_dp(a: I64Ptr, n: Int, b: I64Ptr, m: Int, row: I64Ptr) -> Int:
     var b_start = 0
     var an = n
     var bm = m
-    while an > 0 and bm > 0 and a[a_start] == b[b_start]:
+    while an > 0 and bm > 0 and a.unsafe_offset(a_start)[] == b.unsafe_offset(b_start)[]:
         a_start += 1
         b_start += 1
         an -= 1
         bm -= 1
-    while an > 0 and bm > 0 and a[a_start + an - 1] == b[b_start + bm - 1]:
+    while an > 0 and bm > 0 and a.unsafe_offset(a_start + an - 1)[] == b.unsafe_offset(b_start + bm - 1)[]:
         an -= 1
         bm -= 1
     if an == 0:
@@ -206,7 +246,7 @@ def _distance_dp(a: I64Ptr, n: Int, b: I64Ptr, m: Int, row: I64Ptr) -> Int:
             var deletion = above + 1
             var insertion = Int(row.unsafe_load(j - 1)) + 1
             var substitution = diagonal
-            if a[a_start + i - 1] != b[b_start + j - 1]:
+            if a.unsafe_offset(a_start + i - 1)[] != b.unsafe_offset(b_start + j - 1)[]:
                 substitution += 1
             var best = deletion if deletion < insertion else insertion
             if substitution < best:
@@ -223,12 +263,12 @@ def _within(
     var b_start = 0
     var an = n
     var bm = m
-    while an > 0 and bm > 0 and a[a_start] == b[b_start]:
+    while an > 0 and bm > 0 and a.unsafe_offset(a_start)[] == b.unsafe_offset(b_start)[]:
         a_start += 1
         b_start += 1
         an -= 1
         bm -= 1
-    while an > 0 and bm > 0 and a[a_start + an - 1] == b[b_start + bm - 1]:
+    while an > 0 and bm > 0 and a.unsafe_offset(a_start + an - 1)[] == b.unsafe_offset(b_start + bm - 1)[]:
         an -= 1
         bm -= 1
     if an == 0:
@@ -258,7 +298,7 @@ def _within(
             var deletion = above + 1
             var insertion = Int(row.unsafe_load(j - 1)) + 1
             var substitution = diagonal
-            if deletion_token != b[b_start + j - 1]:
+            if deletion_token != b.unsafe_offset(b_start + j - 1)[]:
                 substitution += 1
             var best = deletion if deletion < insertion else insertion
             if substitution < best:
@@ -278,6 +318,12 @@ def _within(
         if row_min > threshold:
             return 0
     return 1 if Int(row.unsafe_load(bm)) <= threshold else 0
+
+
+def _is_aligned(addr: Int, width: Int) -> Bool:
+    # A wide SIMD load is an aligned move; these buffers come from Python, which
+    # does not promise more than 16-byte alignment, so ask the pointer.
+    return (addr % width) == 0
 
 
 @export("med_distance_u8_word")
@@ -317,12 +363,14 @@ def med_distance_u32_word(
             n,
             U32Ptr(unsafe_from_address=b_addr),
             m,
+            _is_aligned(a_addr, simdwidthof[DType.uint32]() * 4),
         )
     return _distance_word(
         U32Ptr(unsafe_from_address=b_addr),
         m,
         U32Ptr(unsafe_from_address=a_addr),
         n,
+        _is_aligned(b_addr, simdwidthof[DType.uint32]() * 4),
     )
 
 

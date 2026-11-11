@@ -5,11 +5,14 @@ noisy or busy machine cannot make one side look faster than the other. Results
 are checked for equality before any timing happens.
 
 Usage:
-    pixi run python bench/ab.py OLD.so NEW.so [rounds]
+    pixi run python bench/ab.py OLD.so NEW.so [rounds] [repeats]
 
 The case list is exactly the one in ``bench/bench.py``, so the reported ratio
 applies to the README table rows. Two sequential best-of-five runs of the same
 pair agree only to a few percent on a shared machine; this agrees to about one.
+With ``repeats`` above 1 the whole alternating sequence is run that many times
+and the median ratio of each case is reported, which is what decides whether a
+change is real when the machine's other tenants come and go.
 """
 
 from __future__ import annotations
@@ -44,9 +47,19 @@ def load_cases():
 
 
 def main() -> None:
+    # Pin to one CPU so the frequency governor does not move this process between
+    # cores (and clock states) mid-measurement; on a loaded machine that alone
+    # moves results by tens of percent. Set AB_AFFINITY=0 to opt out.
+    if os.environ.get("AB_AFFINITY", "1") != "0":
+        try:
+            os.sched_setaffinity(0, {os.sched_getaffinity(0).pop()})
+        except (AttributeError, OSError):
+            pass
+
     old = load(sys.argv[1])
     new = load(sys.argv[2])
     rounds = int(sys.argv[3]) if len(sys.argv) > 3 else 30
+    repeats = int(sys.argv[4]) if len(sys.argv) > 4 else 1
 
     print("| case | old us | new us | ratio old/new |")
     print("| --- | ---: | ---: | ---: |")
@@ -63,19 +76,24 @@ def main() -> None:
             for _ in range(loops):
                 call(old)
             loops *= 2
-        old_best = new_best = float("inf")
-        for _ in range(rounds):
-            start = time.perf_counter()
-            for _ in range(loops):
-                call(old)
-            old_best = min(old_best, (time.perf_counter() - start) / loops)
-            start = time.perf_counter()
-            for _ in range(loops):
-                call(new)
-            new_best = min(new_best, (time.perf_counter() - start) / loops)
+        samples = []
+        for _ in range(repeats):
+            old_best = new_best = float("inf")
+            for _ in range(rounds):
+                start = time.perf_counter()
+                for _ in range(loops):
+                    call(old)
+                old_best = min(old_best, (time.perf_counter() - start) / loops)
+                start = time.perf_counter()
+                for _ in range(loops):
+                    call(new)
+                new_best = min(new_best, (time.perf_counter() - start) / loops)
+            samples.append((old_best, new_best))
+        samples.sort(key=lambda pair: pair[0] / pair[1])
+        old_median, new_median = samples[len(samples) // 2]
         print(
-            f"| {name} | {old_best * 1e6:.1f} | {new_best * 1e6:.1f} | "
-            f"{old_best / new_best:.3f} |"
+            f"| {name} | {old_median * 1e6:.1f} | {new_median * 1e6:.1f} | "
+            f"{old_median / new_median:.3f} |"
         )
 
 

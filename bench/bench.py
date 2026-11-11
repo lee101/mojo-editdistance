@@ -54,6 +54,8 @@ def cases():
     text_100k = "".join(rng.choice("abcdefgh") for _ in range(100_000))
     alphabet = "αβγδε日本語" + "\U00010400"
     unicode_1k = "".join(rng.choice(alphabet) for _ in range(1000))
+    unicode_64 = "".join(rng.choice(alphabet) for _ in range(64))
+    changed_unicode_64 = mutate(unicode_64, 13)
     changed_64 = mutate(ascii_64, 13)
     changed_1024 = mutate(ascii_1024, 29)
     changed_unicode = mutate(unicode_1k, 31)
@@ -70,6 +72,12 @@ def cases():
             lambda: mojo_editdistance.eval(ascii_64, changed_64),
             lambda: upstream_editdistance.eval(ascii_64, changed_64),
             2000,
+        ),
+        (
+            "eval Unicode 64 vs 64",
+            lambda: mojo_editdistance.eval(unicode_64, changed_unicode_64),
+            lambda: upstream_editdistance.eval(unicode_64, changed_unicode_64),
+            500,
         ),
         (
             "eval ASCII 1,024 vs 1,024",
