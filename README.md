@@ -121,6 +121,99 @@ slower at 1,024 tokens), an explicitly hoisted `index * words` base (0.997-1.010
 in the interleaved measurement), and the same row-invariant hoist in the full
 Wagner-Fischer fallback (1.000x).
 
+## Parallel pass: measured, not shipped
+
+`max.algorithm.parallelize` was tried behind a size threshold and removed again:
+it loses to the serial kernel at every size this package's callers reach, so the
+shipped library is still single-threaded. `max` was added to `pixi.toml` for the
+experiment and then removed, so the dependencies are unchanged.
+
+Toolchain: `mojo ==1.2.0.dev2026092605` with `max ==26.7.0.dev2026092605`, the
+pair `MOJO_NOTES.md` section 5b pins together. `from max.algorithm import
+parallelize` compiled and ran from the ctypes-loaded shared library; only the
+`std.algorithm` and `std.threading` forms are broken, and none were used.
+
+Where parallel work could go. The Myers bit-vector kernels (short strings, and
+patterns up to 1,024 tokens) carry `vp`/`vn` from one text position to the next,
+so their text scan cannot be split. The only independent work is the
+Wagner-Fischer fallback used above 1,024 tokens, which fills one row at a time
+with the cells of a row independent of each other. The experiment therefore
+split each row's columns across workers with one `parallelize` call per row, and
+compared it against `_distance_dp` on identical input. Common-prefix and suffix
+trimming was left out of the parallel variant so the measured cost is the DP
+itself.
+
+Serial cost first (`bench/sizes.py`, `eval` of two random strings of equal
+length, best of five batches):
+
+| n | serial |
+| ---: | ---: |
+| 1,024 | 169 us |
+| 2,048 | 7.8 ms |
+| 4,096 | 30.8 ms |
+| 8,192 | 126 ms |
+| 16,384 | 500 ms |
+
+The crossover measurement had to clear two obstacles before it could be trusted,
+and neither could be removed on this toolchain:
+
+- **The per-call `parallelize` overhead dominates at these sizes.** An empty
+  body at 2, 4, 8 and 16 workers measured 4.7-5.7 ms per call on this host,
+  independent of the work item count in that run, and slow in the
+  same way whether the calls came from a tight loop inside one shared-library
+  function or from a Python loop over ctypes calls; at one worker the same
+  shape costs about 0.05 us per 16,000 items. That is more than the whole
+  serial DP costs up to about n=1,024, so splitting a row must pay the
+  overhead before any cell work is saved. The same loop measured 2.1-3.4 s per
+  call in a later run under heavier host load, so the absolute figure is not
+  stable.
+- **No usable row barrier was found.** Variants with `parallelize(func, items,
+  workers)` called once per row, compared with the serial kernel on the same
+  input: the first reproduction matched at 1 and 2 workers and differed at 3, 4,
+  8 and 16 (serial 111 against 110-115); that small case rerun per worker count
+  then failed on 14 of its 80 invocations (five runs of 16 worker counts), with
+  a different wrong
+  value on each run of the same input. The pattern is consistent with
+  row-to-row order not being enforced - the next row sometimes reads a cell its
+  worker has not written yet - but that was not proven by inspection. No other
+  export in this toolchain's `max.algorithm` synchronises worker tasks: it
+  exports `parallelize` (two overloads) and nothing else. `std.threading` does
+  not exist on 1.2.0 (`MOJO_NOTES.md` section 4), so there is no barrier to
+  build on.
+
+Measured rows, the DP kernel on 128-token random integer sequences on the
+experimental build (one run, host load average ~15 on 72 cores), serial versus
+the same kernel at 1, 2, 4, 8 and 16 workers:
+
+| configuration | n=128 | result |
+| --- | ---: | --- |
+| serial Wagner-Fischer | 54-92 us | matches reference |
+| 1 worker `parallelize` per row | 74-105 us | matches; 0.81-1.24x of serial |
+| 2 workers | ~2.1 s per call | the slowest launch case, and later the same build also disagreed with the serial kernel (173-175 against 111) |
+| 4 workers | wrong result (112 against 111) | |
+| 8 workers | wrong result (102 against 111); one run also took 3.4 s | |
+| 16 workers | wrong result (113-114 against 111) | |
+
+The 2-worker figure is per call in a tight loop on this host under load (~95
+runnable processes); it is not a per-row cost. The one-worker row was measured
+twice: in one run it beat the serial kernel (74 us against 92 us), in another it
+lost (105 us against 54 us), so it is parity within noise, not a gain. Nothing
+here approaches a win: the best case is one worker at parity, and every higher
+count is both slower and wrong. Under the phase rule a parallel path that loses
+to serial at the sizes real callers pass is worse than none, so it was reverted
+rather than shipped with a threshold. A size threshold could not have saved it
+either - the defect is the missing barrier, not the threshold - and sizes above
+1,024 tokens are only reached by `eval`, which already runs in linear time on
+the Myers kernel at those sizes. A correct barrier would still not make the
+split pay: the per-call cost above exceeds the whole serial DP at n=2,048, so
+only much larger cell counts could amortise it, and the result would say more
+about thread-pool overhead than about this kernel.
+
+Before and after for the shipped library are therefore identical: the README
+table above still stands, and `pixi run build && pixi run test` passes with 30
+tests on the unchanged serial kernels. `bench/sizes.py` is new and exists so a
+future attempt can reuse the serial curve and the size sweep.
+
 Two techniques from the brief do not apply here. There is no floating-point
 accumulation in this package - every score is an integer - so multi-accumulator
 reduction has nothing to act on, and the one SIMD `reduce_add` is an integer
@@ -146,11 +239,15 @@ trimming, keeping auxiliary memory linear in the shorter input. Criterion calls
 use a threshold-width DP band, so small thresholds avoid filling the rest of
 the matrix.
 
-There is no threaded or GPU path. Myers advances through the text with a loop-
-carried state, while each Wagner-Fischer cell depends on its left, upper, and
-diagonal neighbors. No current kernel combines enough independent work with
-high arithmetic intensity to offset thread, GPU launch, and transfer overhead,
-so a GPU path would not be justified.
+There is no threaded or GPU path. The kernels have no usable thread barrier on
+this toolchain - `max.algorithm` exports only `parallelize`, and
+`std.threading` does not exist on 1.2.0 - so the Wagner-Fischer fallback could
+not split a row correctly, and the Myers kernels are sequential by construction.
+Even with a barrier, `parallelize` measured about 5 ms per call regardless of the work
+size, above the serial kernel's cost for the sizes this package is used at. The
+measurement, including the sizes swept and the wrong results that motivated the
+revert, is in "Parallel pass" above. A GPU path would face the same sequencing
+and would not be justified.
 
 The exported Mojo functions live in one compilation unit to keep build cost
 fixed. They use a C ABI and are loaded by Python through `ctypes`.
