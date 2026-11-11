@@ -60,6 +60,10 @@ def cases():
     integers = [rng.randrange(100) for _ in range(1000)]
     criterion_a = "".join(rng.choice("abcd") for _ in range(2000))
     criterion_b = "z" * 12 + criterion_a[12:]
+    criterion_c = "".join(
+        "z" if index % 7 == 0 else char
+        for index, char in enumerate(criterion_a)
+    )
     return [
         (
             "eval ASCII 64 vs 64",
@@ -98,6 +102,16 @@ def cases():
             ),
             lambda: upstream_editdistance.eval_criterion(
                 criterion_a, criterion_b, 2
+            ),
+            10,
+        ),
+        (
+            "criterion 2,000 chars, threshold 16",
+            lambda: mojo_editdistance.eval_criterion(
+                criterion_a, criterion_c, 16
+            ),
+            lambda: upstream_editdistance.eval_criterion(
+                criterion_a, criterion_c, 16
             ),
             10,
         ),

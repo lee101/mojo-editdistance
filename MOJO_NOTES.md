@@ -31,6 +31,30 @@ toolchain bump rather than trusting this file.
 - `SIMD` has no `.min()` / `.max()` methods. The free `min(a, b)` / `max(a, b)`
   work on both scalars and `SIMD` values.
 
+## 1b. Compile-time unrolling on 1.2.0 — checked, does not use `@parameter for`
+
+`MOJO_NOTES` otherwise says nothing about unrolling, so this was probed directly:
+
+- `@parameter for i in range(k):` — **rejected**: `'for' statement does not
+  support decorators; remove the decorator`. The same error comes from
+  `@unroll`, and `parameter i in range(k):` is an unknown declaration.
+- `comptime while` — rejected: `'comptime' cannot be used with 'while'`.
+- The decorator is also renamed: `@parameter` on a nested `def` now warns
+  `'@parameter' is deprecated; use '@__parameter'`, and `@__parameter` works.
+- What does work is a parameterised nested `def` invoked with comptime
+  arguments, which is a manual unroll of a known trip count:
+  ```mojo
+  @__parameter
+  def body[i: Int]():
+      ...
+  body[0]()
+  body[1]()
+  ```
+  This only helps a **compile-time** trip count. Every hot loop in these ports
+  is bounded by an input length, so there is nothing to unroll this way; the
+  C compiler emitted the same code for merged/unmerged variants in
+  practice (measure rather than assume).
+
 ## 2. Export / FFI
 
 - `@export("symbol_name")` sits on the line above the def. The ABI is an *effect*

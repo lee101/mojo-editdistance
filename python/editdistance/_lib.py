@@ -11,6 +11,10 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SOURCE = os.path.join(ROOT, "src", "editdistance.mojo")
 LIBRARY = os.path.join(ROOT, "dist", "libmojo-editdistance.so")
+# Pre-built libraries can be compared with e.g.
+# ``EDITDISTANCE_LIBRARY=/tmp/lib.so pixi run python bench/bench.py``.
+# The override only redirects loading; it never triggers a build.
+LIBRARY_OVERRIDE = os.environ.get("EDITDISTANCE_LIBRARY")
 BUILD_SCRIPT = os.path.join(ROOT, "build", "build.sh")
 
 I = ctypes.c_ssize_t
@@ -30,6 +34,10 @@ _library: ctypes.CDLL | None = None
 
 
 def build(force: bool = False) -> str:
+    if LIBRARY_OVERRIDE:
+        if not os.path.exists(LIBRARY_OVERRIDE):
+            raise RuntimeError(f"EDITDISTANCE_LIBRARY not found: {LIBRARY_OVERRIDE}")
+        return LIBRARY_OVERRIDE
     if (
         not force
         and os.path.exists(LIBRARY)
