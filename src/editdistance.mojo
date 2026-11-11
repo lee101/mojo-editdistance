@@ -36,7 +36,7 @@ def _distance_word[dtype: DType](
         var j = 0
         var target = SIMD[dtype, W](text[i])
         while j + W <= pattern_len:
-            var matches = pattern.load[width=W](j).eq(target)
+            var matches = pattern.unsafe_load[width=W](j).eq(target)
             x += matches.select(weights, zeros).reduce_add()
             weights = weights << shift
             j += W
