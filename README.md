@@ -246,11 +246,104 @@ not split a row correctly, and the Myers kernels are sequential by construction.
 Even with a barrier, `parallelize` measured about 5 ms per call regardless of the work
 size, above the serial kernel's cost for the sizes this package is used at. The
 measurement, including the sizes swept and the wrong results that motivated the
-revert, is in "Parallel pass" above. A GPU path would face the same sequencing
-and would not be justified.
+revert, is in "Parallel pass" above. The GPU phase reached the same conclusion
+from measured transfer cost rather than from the threading workaround; it is in
+"GPU pass" below.
 
 The exported Mojo functions live in one compilation unit to keep build cost
 fixed. They use a C ABI and are loaded by Python through `ctypes`.
+
+## GPU pass: measured, not shipped
+
+The gate was run first, against `bench/analysis.md`. That file did not exist
+before this pass and has been reconstructed from the kernels in
+`src/editdistance.mojo`; it lists each shape's arithmetic intensity and the
+argument for and against a device path.
+
+**Gates.** `nvidia-smi --query-gpu=memory.free` reported 4,860-5,962 MiB over the
+session, above the 4,000 MiB floor, so the phase was not skipped. The largest
+candidate needs 384 KiB of device memory, far inside the 2 GB cap. **No device
+allocation or launch was made from the shipped library**: nothing in `src/` or
+`python/` imports `max`, and `pixi.toml`/`pixi.lock` are unchanged.
+
+**What was actually exercised.** `bench/gpu_probe.py` ran in a scratch
+`mojo==1.2.0.dev2026092605` + `max==26.7.0.dev2026092605` environment (the
+repository's own pixi environment does not carry `max`, so `from max.gpu ...` fails
+there; see `MOJO_NOTES.md` section 5b). It constructed a `DeviceContext` on the
+`NVIDIA GeForce RTX 5090`, copies a 1,000,003-element buffer in, launches one
+`_inc` kernel across a 3,907-block grid (last block partial), copies back, and
+reports `tail ok: True`. The tail is explicit and checked, not assumed.
+
+**Why nothing ships.** The two kernels real callers reach are on either side of
+the 2-operations-per-byte gate, and neither side produces a shippable win:
+
+| path | intensity | verdict |
+| --- | ---: | --- |
+| bit kernel, 64 vs 100,000 | 1.12 ops/byte | **CPU only: memory-bound** |
+| bit kernel, 1,024 vs 1,024 | 256 ops/byte | 143-170 us CPU vs ~16 us transfer; but the text scan carries `vp`/`vn` per position, so the required "one launch, copies outside the loop" shape does not exist for it |
+| criterion, 2,000 / threshold 16 | 8.0 ops/byte | whole call is 23-27 us; the round trip alone is ~30 us |
+| Wagner-Fischer 16,384 vs 16,384 | 4,096 ops/byte | transfer is ~17 us against 508-520 ms CPU, but this is the fallback path: real callers of that size are routed to the bit kernel, and the DP has no row parallelism |
+
+The measured host<->device round trip (copy in + copy out + sync, best of 20) was
+128 KiB: 16 us; 512 KiB: 42 us; 2 MiB: 123 us; 8 MiB: 419 us; 32 MiB: 1155 us;
+128 MiB: 4179 us - about 8 GB/s both ways, i.e. host `memcpy` cost. A kernel launch
+plus sync round trip measured 6.8-12.7 us.
+
+A caveat that is part of the record: the sub-MiB round-trip numbers are bimodal on
+this shared host. Twenty cold invocations of the 128 KiB trip gave 12 runs of
+8.1-10.7 us and 8 runs of 309-2270 us, with GPU memory free unchanged and a kernel
+making no allocations; the table above quotes the fast mode. The slow mode makes
+the GPU case worse, never better, so no decision here depends on the choice.
+
+CPU comparison for the same calls, in this checkout
+(`pixi run python bench/gpu_sizes.py`):
+
+| case | CPU today |
+| --- | ---: |
+| eval ASCII 64 vs 100,000 | 484 us |
+| eval ASCII 1,024 vs 1,024 | 170 us |
+| criterion 2,000, threshold 16 | 27 us |
+| eval integer lists 4,096 vs 4,096 (no trim) | 33.4 ms |
+| eval integer lists 16,384 vs 16,384 (no trim) | 520 ms |
+
+**Before and after are identical.** No shipped code changed, so the benchmark table
+above still stands unchanged; this pass adds `bench/analysis.md`,
+`bench/gpu_probe.py`, `bench/gpu_sizes.py` and `tests/test_gpu.py`, plus a
+`gpu-probe` task in `pixi.toml` that is not part of `build` or `test`.
+
+**Test results.** `pixi run test` reports `31 passed, 3 skipped`: the 30 unchanged
+tests plus one CPU-fallback test pass, and the 3 GPU tests are **skipped** because
+`EDITDISTANCE_GPU_PROBE` is not set in the repository environment (which has no
+`max`).
+Setting `EDITDISTANCE_GPU_PROBE` to a `mojo` binary from a `max` environment
+runs all 4 GPU-file tests against the real device. On a host without a GPU the
+probe exits 2 and the tests skip with "no usable GPU device" rather than fail.
+To reproduce:
+
+```bash
+pixi init /tmp/gpu && cd /tmp/gpu
+pixi add 'mojo ==1.2.0.dev2026092605' 'max ==26.7.0.dev2026092605'
+cd /path/to/mojo-editdistance
+EDITDISTANCE_GPU_PROBE=/tmp/gpu/.pixi/envs/default/bin/mojo pixi run test
+```
+
+`MOJO_NOTES.md` section 5's GPU sample is stale on this toolchain and the probe
+uses the shapes the compiler accepts: `enqueue_create_buffer[DType.int64](n)` (not
+`[Int64]`), `grid_dim=`/`block_dim=` keyword arguments, `block_idx.x` /
+`thread_idx.x` (not `.value`, and `Int(block_idx)` is host-only), kernel arguments
+as fixed-width `Int64` (`Int` is not `DevicePassable`), and `enqueue_copy(dst, src)`.
+`bench/gpu_probe.py` documents each of these at the point it matters.
+
+**One CPU number worth flagging.** The 16,384 by 16,384 DP fallback appears in
+this README as 508-520 ms and also as 126 ms for 8,192 in the parallel-pass table,
+which would make the doubling 4x rather than 2x. The 508-520 ms figure was checked
+two ways: `eval` on integer arrays with no common prefix or suffix, and a minimal
+copy of the shipped `_distance_dp` row loop with trimming disabled, both at
+508-521 ms. A faster standalone attempt was **wrong**, not faster: it returned
+15,544 where the plain loop returns 11,374, and a corrected version was no faster
+than the plain loop. So the DP cost here is measured, not assumed, and nothing in
+this pass derives a GPU win from it. The 8,192 row was not re-measured; the
+`bench/sizes.py` curve it came from is unchanged.
 
 ## Not covered
 
